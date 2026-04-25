@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # DEPLOY LÊN STREAMLIT COMMUNITY CLOUD:
 # 1. Chạy local: streamlit run streamlit_app/app.py
 # 2. Upload tài liệu qua sidebar để index vào db_streamlit/
@@ -5,37 +7,113 @@
 # 4. Vào share.streamlit.io → New app → chọn repo
 #    Main file path: streamlit_app/app.py
 # 5. Advanced settings → Secrets: GOOGLE_API_KEY = "your_key_here"
-#
-# LƯU Ý: db_streamlit/ phải được commit lên GitHub để Streamlit Cloud
-# có dữ liệu đã index (filesystem của Streamlit Cloud bị reset khi redeploy).
-from __future__ import annotations
 
 import io
+import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from pypdf import PdfReader
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 DB_PATH = Path(__file__).parent.parent / "db_streamlit"
-COLLECTION_NAME = "slide_streamlit"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 LLM_MODEL = "gemini-2.5-flash"
 TOP_K = 10
 
-st.set_page_config(
-    page_title="Document Chat",
-    page_icon="📚",
-    layout="wide",
-)
+st.set_page_config(page_title="Document Chat", page_icon="📚", layout="wide")
 
+
+# ── Lightweight vector store (numpy + json, không cần chromadb) ──────────────
+
+@dataclass
+class Document:
+    page_content: str
+    metadata: dict = field(default_factory=dict)
+
+
+class SimpleVectorStore:
+    def __init__(self, store_path: Path, api_key: str):
+        self.store_path = Path(store_path)
+        self.api_key = api_key
+        self._docs_file = self.store_path / "documents.json"
+        self._vecs_file = self.store_path / "vectors.npy"
+        self.store_path.mkdir(parents=True, exist_ok=True)
+        self._docs: list[dict] = []
+        self._vecs: np.ndarray | None = None
+        self._load()
+
+    def _load(self):
+        if self._docs_file.exists():
+            self._docs = json.loads(self._docs_file.read_text(encoding="utf-8"))
+        if self._vecs_file.exists() and self._docs:
+            self._vecs = np.load(str(self._vecs_file))
+
+    def _save(self):
+        self._docs_file.write_text(
+            json.dumps(self._docs, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        if self._vecs is not None and len(self._vecs):
+            np.save(str(self._vecs_file), self._vecs)
+        elif self._vecs_file.exists():
+            self._vecs_file.unlink()
+
+    def _embed(self, texts: list[str]) -> np.ndarray:
+        client = genai.Client(api_key=self.api_key)
+        result = client.models.embed_content(model=EMBEDDING_MODEL, contents=texts)
+        return np.array([e.values for e in result.embeddings], dtype=np.float32)
+
+    def add_documents(self, docs: list[Document]):
+        texts = [d.page_content for d in docs]
+        new_vecs = self._embed(texts)
+        for doc in docs:
+            self._docs.append({"content": doc.page_content, "metadata": doc.metadata})
+        self._vecs = (
+            new_vecs if self._vecs is None or len(self._vecs) == 0
+            else np.vstack([self._vecs, new_vecs])
+        )
+        self._save()
+
+    def similarity_search(self, query: str, k: int = 10) -> list[Document]:
+        if not self._docs or self._vecs is None or len(self._vecs) == 0:
+            return []
+        q_vec = self._embed([query])[0]
+        q_norm = np.linalg.norm(q_vec)
+        if q_norm == 0:
+            return []
+        norms = np.linalg.norm(self._vecs, axis=1)
+        safe_norms = np.where(norms == 0, 1e-10, norms)
+        scores = (self._vecs @ q_vec) / (safe_norms * q_norm)
+        top_idx = np.argsort(scores)[::-1][:k]
+        return [
+            Document(
+                page_content=self._docs[i]["content"],
+                metadata=self._docs[i]["metadata"],
+            )
+            for i in top_idx
+        ]
+
+    def get_all_metadata(self) -> list[dict]:
+        return [d["metadata"] for d in self._docs]
+
+    def delete_by_filename(self, filename: str):
+        keep = [
+            i for i, d in enumerate(self._docs)
+            if d["metadata"].get("filename") != filename
+        ]
+        self._docs = [self._docs[i] for i in keep]
+        self._vecs = self._vecs[keep] if keep and self._vecs is not None else None
+        self._save()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_api_key() -> str | None:
     try:
@@ -49,23 +127,13 @@ def get_api_key() -> str | None:
 
 
 @st.cache_resource
-def get_vectorstore(api_key: str) -> Chroma:
-    DB_PATH.mkdir(parents=True, exist_ok=True)
-    embedding = GoogleGenerativeAIEmbeddings(
-        model=EMBEDDING_MODEL,
-        google_api_key=api_key,
-    )
-    return Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embedding,
-        persist_directory=str(DB_PATH),
-    )
+def get_store(api_key: str) -> SimpleVectorStore:
+    return SimpleVectorStore(DB_PATH, api_key)
 
 
 def chunk_file(uploaded_file) -> list[Document]:
     filename = uploaded_file.name
     docs: list[Document] = []
-
     if filename.lower().endswith(".pdf"):
         reader = PdfReader(io.BytesIO(uploaded_file.read()))
         for page_num, page in enumerate(reader.pages, start=1):
@@ -87,28 +155,26 @@ def chunk_file(uploaded_file) -> list[Document]:
                 page_content=f"[{filename} - Phần {i}]\n{chunk}",
                 metadata={"filename": filename, "page": i, "source": filename},
             ))
-
     return docs
 
 
 def index_documents(files, api_key: str):
     all_docs: list[Document] = []
     for f in files:
-        chunks = chunk_file(f)
-        all_docs.extend(chunks)
+        all_docs.extend(chunk_file(f))
 
     if not all_docs:
         st.warning("Không tìm thấy nội dung trong các file đã upload.")
         return
 
-    vs = get_vectorstore(api_key)
+    store = get_store(api_key)
     batch_size = 5
     total = len(all_docs)
     progress = st.progress(0, text="Đang index tài liệu...")
 
     for i in range(0, total, batch_size):
         batch = all_docs[i:i + batch_size]
-        vs.add_documents(batch)
+        store.add_documents(batch)
         progress.progress(
             min((i + batch_size) / total, 1.0),
             text=f"Đang index... {min(i + batch_size, total)}/{total} chunks",
@@ -123,10 +189,9 @@ def get_indexed_files(api_key: str) -> list[dict]:
     if "indexed_files_cache" in st.session_state:
         return st.session_state["indexed_files_cache"]
     try:
-        vs = get_vectorstore(api_key)
-        result = vs._collection.get(include=["metadatas"])
+        store = get_store(api_key)
         counts: dict[str, int] = {}
-        for meta in result.get("metadatas", []):
+        for meta in store.get_all_metadata():
             fname = meta.get("filename", "unknown")
             counts[fname] = counts.get(fname, 0) + 1
         file_list = [{"filename": k, "chunks": v} for k, v in counts.items()]
@@ -137,26 +202,22 @@ def get_indexed_files(api_key: str) -> list[dict]:
 
 
 def delete_document(filename: str, api_key: str):
-    vs = get_vectorstore(api_key)
-    vs._collection.delete(where={"filename": filename})
+    get_store(api_key).delete_by_filename(filename)
     st.session_state.pop("indexed_files_cache", None)
 
 
 def get_sources_and_context(query: str, api_key: str) -> tuple[str, list[dict]]:
-    vs = get_vectorstore(api_key)
-    docs = vs.similarity_search(query, k=TOP_K)
-    context = "\n\n".join(doc.page_content for doc in docs)
+    docs = get_store(api_key).similarity_search(query, k=TOP_K)
+    context = "\n\n".join(d.page_content for d in docs)
     seen: set[tuple] = set()
     sources: list[dict] = []
     for doc in docs:
-        fname = doc.metadata.get("filename", "")
-        page = doc.metadata.get("page", 0)
-        key = (fname, page)
+        key = (doc.metadata.get("filename", ""), doc.metadata.get("page", 0))
         if key not in seen:
             seen.add(key)
             sources.append({
-                "filename": fname,
-                "page": page,
+                "filename": doc.metadata.get("filename", ""),
+                "page": doc.metadata.get("page", 0),
                 "preview": doc.page_content[:200],
             })
     return context, sources
@@ -176,13 +237,13 @@ def stream_answer(query: str, context: str, api_key: str):
             yield chunk.text
 
 
-# ── Session state ────────────────────────────────────────────────────────────
+# ── Session state ─────────────────────────────────────────────────────────────
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "api_key" not in st.session_state:
     st.session_state.api_key = ""
 
-# ── Sidebar ──────────────────────────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📚 Document Understanding")
     st.divider()
@@ -239,7 +300,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 st.title("💬 Hỏi đáp tài liệu")
 
 if not st.session_state.messages:
