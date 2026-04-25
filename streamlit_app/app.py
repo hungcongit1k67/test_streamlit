@@ -8,6 +8,7 @@
 #
 # LƯU Ý: db_streamlit/ phải được commit lên GitHub để Streamlit Cloud
 # có dữ liệu đã index (filesystem của Streamlit Cloud bị reset khi redeploy).
+from __future__ import annotations
 
 import io
 import os
