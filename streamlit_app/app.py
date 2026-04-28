@@ -14,22 +14,32 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import fitz  # pymupdf
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from pypdf import PdfReader
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 DB_PATH = Path(__file__).parent.parent / "db_streamlit"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-LLM_MODEL = "gemini-2.5-flash-lite"
-# LLM_MODEL = "gemini-3-flash"
-# LLM_MODEL = "gemini-2.5-flash"
+LLM_MODEL = "gemini-2.5-flash"
+#LLM_MODEL = "gemini-2.5-flash-lite"
+OCR_MODEL = "gemini-2.5-flash"
 TOP_K = 10
 
 st.set_page_config(page_title="Document Chat", page_icon="📚", layout="wide")
+
+# ── Google OAuth Login Gate ───────────────────────────────────────────────────
+if not st.user.is_logged_in:
+    st.title("📚 Document Chat")
+    st.markdown("Vui lòng đăng nhập để sử dụng ứng dụng.")
+    if st.button("🔐 Đăng nhập với Google", type="primary", use_container_width=False):
+        st.login("google")
+    st.stop()
 
 
 # ── Lightweight vector store (numpy + json, không cần chromadb) ──────────────
@@ -133,13 +143,50 @@ def get_store(api_key: str) -> SimpleVectorStore:
     return SimpleVectorStore(DB_PATH, api_key)
 
 
-def chunk_file(uploaded_file) -> list[Document]:
+def ocr_page_with_gemini(pdf_bytes: bytes, page_index: int, api_key: str) -> str:
+    """Render a PDF page to image and OCR it with Gemini Vision."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_index]
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+    img_bytes = pix.tobytes("png")
+    doc.close()
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=OCR_MODEL,
+        contents=[
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(inline_data=types.Blob(mime_type="image/png", data=img_bytes)),
+                    types.Part(text=(
+                        "Trích xuất toàn bộ văn bản từ hình ảnh trang tài liệu này. "
+                        "Chỉ trả về văn bản gốc, không thêm giải thích hay định dạng thêm."
+                    )),
+                ],
+            )
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def chunk_file(uploaded_file, api_key: str | None = None) -> tuple[list[Document], int]:
+    """Returns (docs, ocr_page_count)."""
     filename = uploaded_file.name
     docs: list[Document] = []
+    ocr_count = 0
     if filename.lower().endswith(".pdf"):
-        reader = PdfReader(io.BytesIO(uploaded_file.read()))
+        pdf_bytes = uploaded_file.read()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
         for page_num, page in enumerate(reader.pages, start=1):
             text = (page.extract_text() or "").strip()
+            if not text and api_key:
+                try:
+                    text = ocr_page_with_gemini(pdf_bytes, page_num - 1, api_key)
+                    if text:
+                        ocr_count += 1
+                except Exception as e:
+                    st.error(f"OCR trang {page_num} thất bại: {type(e).__name__}: {e}")
             if not text:
                 continue
             docs.append(Document(
@@ -157,13 +204,16 @@ def chunk_file(uploaded_file) -> list[Document]:
                 page_content=f"[{filename} - Phần {i}]\n{chunk}",
                 metadata={"filename": filename, "page": i, "source": filename},
             ))
-    return docs
+    return docs, ocr_count
 
 
 def index_documents(files, api_key: str):
     all_docs: list[Document] = []
+    total_ocr = 0
     for f in files:
-        all_docs.extend(chunk_file(f))
+        docs, ocr_count = chunk_file(f, api_key)
+        all_docs.extend(docs)
+        total_ocr += ocr_count
 
     if not all_docs:
         st.warning("Không tìm thấy nội dung trong các file đã upload.")
@@ -183,7 +233,10 @@ def index_documents(files, api_key: str):
         )
 
     progress.empty()
-    st.success(f"✅ Đã index {total} chunks từ {len(files)} file!")
+    msg = f"✅ Đã index {total} chunks từ {len(files)} file!"
+    if total_ocr:
+        msg += f" (OCR {total_ocr} trang ảnh)"
+    st.success(msg)
     st.session_state.pop("indexed_files_cache", None)
 
 
@@ -248,6 +301,13 @@ if "api_key" not in st.session_state:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📚 Document Understanding")
+    st.divider()
+
+    user = st.user
+    st.markdown(f"👤 **{user.name}**")
+    st.caption(user.email)
+    if st.button("🚪 Đăng xuất", use_container_width=True):
+        st.logout()
     st.divider()
 
     api_key = get_api_key()
