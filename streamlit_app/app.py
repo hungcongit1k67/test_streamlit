@@ -25,8 +25,8 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 DB_PATH = Path(__file__).parent.parent / "db_streamlit"
 EMBEDDING_MODEL = "models/gemini-embedding-001"
 # LLM_MODEL = "gemini-2.5-flash-lite"
-LLM_MODEL = "gemini-3-flash"
-# LLM_MODEL = "gemini-2.5-flash"
+# LLM_MODEL = "gemini-3-flash"
+LLM_MODEL = "gemini-2.5-flash"
 TOP_K = 10
 
 st.set_page_config(page_title="Document Chat", page_icon="📚", layout="wide")
