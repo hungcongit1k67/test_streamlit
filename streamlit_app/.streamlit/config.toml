@@ -1,3 +1,6 @@
+[client]
+mathEnabled = true
+
 [theme]
 primaryColor = "#0ea5e9"
 backgroundColor = "#ffffff"
