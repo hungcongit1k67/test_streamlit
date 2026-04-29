@@ -33,17 +33,12 @@ TOP_K = 10
 
 st.set_page_config(page_title="Document Chat", page_icon="📚", layout="wide")
 
-# ── Password Login Gate ───────────────────────────────────────────────────────
-if not st.session_state.get("authenticated"):
+# ── Google OAuth Login Gate ───────────────────────────────────────────────────
+if not st.user.is_logged_in:
     st.title("📚 Document Chat")
-    st.markdown("Vui lòng nhập mật khẩu để sử dụng ứng dụng.")
-    pwd = st.text_input("Mật khẩu:", type="password")
-    if st.button("🔐 Đăng nhập", type="primary"):
-        if pwd == st.secrets.get("APP_PASSWORD", ""):
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Mật khẩu không đúng!")
+    st.markdown("Vui lòng đăng nhập để sử dụng ứng dụng.")
+    if st.button("🔐 Đăng nhập với Google", type="primary", use_container_width=False):
+        st.login("google")
     st.stop()
 
 
@@ -308,10 +303,11 @@ with st.sidebar:
     st.markdown("## 📚 Document Understanding")
     st.divider()
 
-    st.markdown("👤 **Đã đăng nhập**")
+    user = st.user
+    st.markdown(f"👤 **{user.name}**")
+    st.caption(user.email)
     if st.button("🚪 Đăng xuất", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
+        st.logout()
     st.divider()
 
     api_key = get_api_key()
